@@ -5,6 +5,9 @@ import { McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
 import { Client as SSHClient } from 'ssh2';
 import { z } from 'zod';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import * as path from 'path';
+import * as os from 'os';
+import * as fs from 'fs';
 
 // Example usage: node build/index.js --host=1.2.3.4 --port=22 --user=root --password=pass --key=path/to/key --timeout=5000
 function parseArgv() {
@@ -278,6 +281,206 @@ export function escapeCommandForShell(command: string): string {
   return command.replace(/'/g, "'\"'\"'");
 }
 
+/**
+ * Expand ~ in remote paths to the remote user's home directory
+ *
+ * @param sftp - Active SFTP session
+ * @param remotePath - Remote path that may contain ~
+ * @returns Promise resolving to expanded absolute path
+ *
+ * @example
+ * expandRemotePath(sftp, '~/Desktop/file.txt')
+ * // Returns: '/home/username/Desktop/file.txt' or '/Users/username/Desktop/file.txt'
+ *
+ * @example
+ * expandRemotePath(sftp, '/absolute/path')
+ * // Returns: '/absolute/path' (unchanged)
+ */
+export async function expandRemotePath(sftp: any, remotePath: string): Promise<string> {
+  // If path doesn't start with ~, return as-is
+  if (!remotePath.startsWith('~')) {
+    return remotePath;
+  }
+
+  return new Promise((resolve, reject) => {
+    // Use realpath to resolve ~ on the remote server
+    // The '.' argument gets the home directory when called on ~
+    const pathToResolve = remotePath === '~' ? '~' : remotePath;
+
+    sftp.realpath(pathToResolve, (err: any, resolvedPath: string) => {
+      if (err) {
+        // Fallback: if realpath fails, return original path
+        // This handles edge cases where ~ might not be expandable
+        debugLog('Remote path expansion failed, using original path:', err.message);
+        resolve(remotePath);
+      } else {
+        debugLog('Remote path expanded:', remotePath, '->', resolvedPath);
+        resolve(resolvedPath);
+      }
+    });
+  });
+}
+
+/**
+ * Validate and normalize a local file path for download operations
+ *
+ * @param localPath - The path to validate (can be relative, absolute, or contain ~)
+ * @returns Object with validation result
+ *
+ * Validation checks:
+ * - Expands ~ to user home directory
+ * - Resolves relative paths (. and ..) to absolute paths
+ * - Checks if parent directory exists and is writable
+ * - Returns normalized absolute path
+ *
+ * @example
+ * validateLocalDownloadPath('~/file.txt')
+ * // Returns: { valid: true, normalizedPath: '/home/user/file.txt' }
+ *
+ * @example
+ * validateLocalDownloadPath('./file.txt')
+ * // Returns: { valid: true, normalizedPath: '/current/dir/file.txt' }
+ *
+ * @example
+ * validateLocalDownloadPath('/nonexistent/dir/file.txt')
+ * // Returns: { valid: false, error: 'Directory /nonexistent/dir does not exist. Create it first with: mkdir -p /nonexistent/dir', normalizedPath: '...' }
+ */
+export function validateLocalDownloadPath(localPath: string): {
+  valid: boolean;
+  normalizedPath: string;
+  error?: string;
+  suggestion?: string;
+} {
+  try {
+    // Expand ~ to home directory
+    let normalized = localPath;
+    if (normalized.startsWith('~/')) {
+      normalized = path.join(os.homedir(), normalized.slice(2));
+    } else if (normalized === '~') {
+      normalized = os.homedir();
+    }
+
+    // Resolve relative paths to absolute
+    normalized = path.resolve(normalized);
+
+    // Get parent directory
+    const parentDir = path.dirname(normalized);
+
+    // Check if parent directory exists
+    if (!fs.existsSync(parentDir)) {
+      return {
+        valid: false,
+        normalizedPath: normalized,
+        error: `Local directory '${parentDir}' does not exist`,
+        suggestion: `Create it first with: mkdir -p "${parentDir}"`
+      };
+    }
+
+    // Check if parent directory is writable
+    try {
+      fs.accessSync(parentDir, fs.constants.W_OK);
+    } catch (err) {
+      return {
+        valid: false,
+        normalizedPath: normalized,
+        error: `Local directory '${parentDir}' is not writable`,
+        suggestion: `Check permissions with: ls -ld "${parentDir}"`
+      };
+    }
+
+    return {
+      valid: true,
+      normalizedPath: normalized
+    };
+  } catch (err: any) {
+    return {
+      valid: false,
+      normalizedPath: localPath,
+      error: `Path validation error: ${err.message}`
+    };
+  }
+}
+
+/**
+ * Validate and normalize a local file path for upload operations
+ *
+ * @param localPath - The path to validate (can be relative, absolute, or contain ~)
+ * @returns Object with validation result
+ *
+ * Validation checks:
+ * - Expands ~ to user home directory
+ * - Resolves relative paths to absolute paths
+ * - Checks if file exists and is readable
+ * - Returns normalized absolute path
+ *
+ * @example
+ * validateLocalUploadPath('~/file.txt')
+ * // Returns: { valid: true, normalizedPath: '/home/user/file.txt' }
+ */
+export function validateLocalUploadPath(localPath: string): {
+  valid: boolean;
+  normalizedPath: string;
+  error?: string;
+  suggestion?: string;
+} {
+  try {
+    // Expand ~ to home directory
+    let normalized = localPath;
+    if (normalized.startsWith('~/')) {
+      normalized = path.join(os.homedir(), normalized.slice(2));
+    } else if (normalized === '~') {
+      normalized = os.homedir();
+    }
+
+    // Resolve relative paths to absolute
+    normalized = path.resolve(normalized);
+
+    // Check if file exists
+    if (!fs.existsSync(normalized)) {
+      return {
+        valid: false,
+        normalizedPath: normalized,
+        error: `Local file '${normalized}' does not exist`,
+        suggestion: `Check the file path and ensure the file exists`
+      };
+    }
+
+    // Check if path is a file (not a directory)
+    const stats = fs.statSync(normalized);
+    if (!stats.isFile()) {
+      return {
+        valid: false,
+        normalizedPath: normalized,
+        error: `Path '${normalized}' is not a file`,
+        suggestion: `Ensure you're specifying a file, not a directory`
+      };
+    }
+
+    // Check if file is readable
+    try {
+      fs.accessSync(normalized, fs.constants.R_OK);
+    } catch (err) {
+      return {
+        valid: false,
+        normalizedPath: normalized,
+        error: `Local file '${normalized}' is not readable`,
+        suggestion: `Check permissions with: ls -l "${normalized}"`
+      };
+    }
+
+    return {
+      valid: true,
+      normalizedPath: normalized
+    };
+  } catch (err: any) {
+    return {
+      valid: false,
+      normalizedPath: localPath,
+      error: `Path validation error: ${err.message}`
+    };
+  }
+}
+
 const server = new McpServer({
   name: 'SSH MCP Server',
   version: '1.2.0',
@@ -336,10 +539,10 @@ server.tool(
 
 server.tool(
   "upload",
-  "Upload files from the local machine to the remote SSH server via SFTP. Use this to transfer configuration files, scripts, data files, or backups TO the remote server. Supports files of any size. Common uses: deploying configs (/etc/nginx/nginx.conf), uploading scripts (~/deploy.sh), transferring data. Example: upload '/tmp/config.json' to '/home/user/app/config.json'",
+  "Upload files from the local machine to the remote SSH server via SFTP. BEST PRACTICE: Use './filename' for local file (from current directory). Remote path supports tilde expansion (~/Desktop/file.txt). The local file MUST exist.",
   {
-    localPath: z.string().describe("Absolute path to the local file to upload. Examples: '/tmp/data.csv', '/home/user/document.pdf', './config.json'. File must exist and be readable"),
-    remotePath: z.string().describe("Absolute destination path on remote server. Examples: '/home/user/uploaded.txt', '/var/www/html/index.html', '~/Desktop/file.txt'. Parent directory must exist"),
+    localPath: z.string().describe("Local file path. RECOMMENDED: './filename' (current directory). Also supports: absolute ('/tmp/file.txt'), tilde ('~/file.txt'). File must exist."),
+    remotePath: z.string().describe("Remote destination path. Supports: absolute paths ('/home/user/file.txt'), tilde expansion ('~/Desktop/file.txt'). Parent directory must exist on remote server."),
   },
   async ({ localPath, remotePath }) => {
     debugLog('Received upload request:', localPath, '->', remotePath);
@@ -360,10 +563,10 @@ server.tool(
 
 server.tool(
   "download",
-  "Download files from the remote SSH server to the local machine via SFTP. Use this to retrieve logs, backups, configurations, or any files FROM the remote server. Supports files of any size. Common uses: fetching logs (/var/log/app.log), downloading backups, retrieving data files. Example: download '/var/log/nginx/error.log' to '/tmp/error.log'",
+  "Download files from the remote SSH server to the local machine via SFTP. BEST PRACTICE: Use './filename' for local path (saves to current directory - most reliable). Remote path supports tilde expansion (~/Desktop/file.txt). Use 'listFiles' to verify remote file exists first if unsure.",
   {
-    remotePath: z.string().describe("Absolute path to file on remote server. Examples: '/var/log/syslog', '/home/user/data.json', '~/Documents/report.pdf'. File must exist and be readable"),
-    localPath: z.string().describe("Absolute path where file will be saved locally. Examples: '/tmp/downloaded.log', './backup.tar.gz', '/home/user/file.txt'. Local directory must exist and be writable"),
+    remotePath: z.string().describe("Remote file path. Supports: absolute paths ('/var/log/syslog'), tilde expansion ('~/Desktop/file.txt'). Use 'listFiles' to verify path first."),
+    localPath: z.string().describe("Local save path. RECOMMENDED: './filename' (current directory). Also supports: absolute ('/tmp/file.txt'), tilde ('~/file.txt'). Parent directory must exist."),
   },
   async ({ remotePath, localPath }) => {
     debugLog('Received download request:', remotePath, '->', localPath);
@@ -384,9 +587,9 @@ server.tool(
 
 server.tool(
   "listFiles",
-  "List all files and directories in a remote directory via SFTP. Returns detailed information including file type (file/dir), size in bytes, and last modified timestamp. Use this to explore remote filesystem, find files, or verify uploads/downloads. Common uses: browsing directories, finding specific files, checking if upload succeeded. Example: list '/home/user/Documents' or '/var/www/html'",
+  "List all files and directories in a remote directory via SFTP. Returns detailed information including file type (file/dir), size in bytes, and last modified timestamp. Supports tilde expansion (~/Desktop). Use this to explore remote filesystem, find files, or verify uploads/downloads. Common uses: browsing directories, finding specific files, checking if upload succeeded.",
   {
-    remotePath: z.string().describe("Absolute path to remote directory to list. Examples: '/home/user', '/var/log', '~/Desktop', '/etc/nginx'. Directory must exist and be readable. Returns list of files with sizes and timestamps"),
+    remotePath: z.string().describe("Path to remote directory. Supports: absolute paths ('/home/user', '/var/log'), tilde expansion ('~/Desktop', '~/Documents'). Directory must exist and be readable. Returns list of files with sizes and timestamps."),
   },
   async ({ remotePath }) => {
     debugLog('Received listFiles request:', remotePath);
@@ -409,7 +612,7 @@ server.tool(
  * Upload a file to the remote SSH server via SFTP
  *
  * @param sshConfig - SSH connection configuration object
- * @param localPath - Absolute path to the local file (e.g., '/tmp/file.txt')
+ * @param localPath - Path to the local file (supports relative paths like './', absolute paths, and ~ expansion)
  * @param remotePath - Absolute destination path on remote server (e.g., '/home/user/file.txt')
  * @returns Promise with upload result and duration
  * @throws McpError if upload fails (file not found, permission denied, connection error)
@@ -423,38 +626,62 @@ export async function uploadFile(sshConfig: any, localPath: string, remotePath: 
     const startTime = Date.now();
     debugLog('Starting SFTP upload:', localPath, '->', remotePath);
 
+    // Validate and normalize local path
+    const localPathValidation = validateLocalUploadPath(localPath);
+    if (!localPathValidation.valid) {
+      const errorMsg = `${localPathValidation.error}. ${localPathValidation.suggestion || ''}`.trim();
+      debugLog('Local path validation failed:', errorMsg);
+      return reject(new McpError(ErrorCode.InvalidParams, errorMsg));
+    }
+
+    const normalizedLocalPath = localPathValidation.normalizedPath;
+    debugLog('Normalized local path:', normalizedLocalPath);
+
     try {
       const conn = await connectionPool.getConnection(sshConfig);
 
-      conn.sftp((err, sftp) => {
+      conn.sftp(async (err, sftp) => {
         if (err) {
           connectionPool.returnConnection(conn);
           return reject(new McpError(ErrorCode.InternalError, `SFTP session error: ${err.message}`));
         }
 
-        sftp.fastPut(localPath, remotePath, (err) => {
+        // Expand ~ in remote path
+        const expandedRemotePath = await expandRemotePath(sftp, remotePath);
+        debugLog('Using expanded remote path for upload:', expandedRemotePath);
+
+        sftp.fastPut(normalizedLocalPath, expandedRemotePath, (err) => {
           const duration = Date.now() - startTime;
           connectionPool.returnConnection(conn);
 
           if (err) {
             auditLog({
               timestamp: new Date().toISOString(),
-              command: `upload ${localPath} -> ${remotePath}`,
+              command: `upload ${normalizedLocalPath} -> ${expandedRemotePath}`,
               error: err.message,
               duration,
             });
-            reject(new McpError(ErrorCode.InternalError, `Upload failed: ${err.message}`));
+
+            // Provide helpful error message for remote path issues
+            let errorMessage = `Upload failed: ${err.message}`;
+            if (err.message.includes('No such file') || err.message.includes('not found')) {
+              errorMessage = `Upload failed: Remote directory may not exist. Verify the remote path '${expandedRemotePath}' or create the parent directory first.`;
+            } else if (err.message.includes('Permission denied')) {
+              errorMessage = `Upload failed: Permission denied for remote path '${expandedRemotePath}'. Check file permissions on remote server.`;
+            }
+
+            reject(new McpError(ErrorCode.InternalError, errorMessage));
           } else {
             auditLog({
               timestamp: new Date().toISOString(),
-              command: `upload ${localPath} -> ${remotePath}`,
+              command: `upload ${normalizedLocalPath} -> ${expandedRemotePath}`,
               exitCode: 0,
               duration,
             });
             resolve({
               content: [{
                 type: 'text',
-                text: `File uploaded successfully: ${localPath} -> ${remotePath} (${duration}ms)`,
+                text: `File uploaded successfully: ${normalizedLocalPath} -> ${expandedRemotePath} (${duration}ms)`,
               }],
             });
           }
@@ -464,7 +691,7 @@ export async function uploadFile(sshConfig: any, localPath: string, remotePath: 
       const duration = Date.now() - startTime;
       auditLog({
         timestamp: new Date().toISOString(),
-        command: `upload ${localPath} -> ${remotePath}`,
+        command: `upload ${normalizedLocalPath} -> ${remotePath}`,
         error: err.message,
         duration,
       });
@@ -478,7 +705,7 @@ export async function uploadFile(sshConfig: any, localPath: string, remotePath: 
  *
  * @param sshConfig - SSH connection configuration object
  * @param remotePath - Absolute path to remote file (e.g., '/var/log/app.log')
- * @param localPath - Absolute path where file will be saved (e.g., '/tmp/app.log')
+ * @param localPath - Path where file will be saved (supports relative paths like './', absolute paths, and ~ expansion)
  * @returns Promise with download result and duration
  * @throws McpError if download fails (file not found, permission denied, connection error)
  *
@@ -491,48 +718,100 @@ export async function downloadFile(sshConfig: any, remotePath: string, localPath
     const startTime = Date.now();
     debugLog('Starting SFTP download:', remotePath, '->', localPath);
 
+    // Validate and normalize local path
+    const localPathValidation = validateLocalDownloadPath(localPath);
+    if (!localPathValidation.valid) {
+      const errorMsg = `${localPathValidation.error}. ${localPathValidation.suggestion || ''}`.trim();
+      debugLog('Local path validation failed:', errorMsg);
+      return reject(new McpError(ErrorCode.InvalidParams, errorMsg));
+    }
+
+    const normalizedLocalPath = localPathValidation.normalizedPath;
+    debugLog('Normalized local path:', normalizedLocalPath);
+
     try {
       const conn = await connectionPool.getConnection(sshConfig);
 
-      conn.sftp((err, sftp) => {
+      conn.sftp(async (err, sftp) => {
         if (err) {
           connectionPool.returnConnection(conn);
           return reject(new McpError(ErrorCode.InternalError, `SFTP session error: ${err.message}`));
         }
 
-        sftp.fastGet(remotePath, localPath, (err) => {
-          const duration = Date.now() - startTime;
-          connectionPool.returnConnection(conn);
+        // Expand ~ in remote path
+        const expandedRemotePath = await expandRemotePath(sftp, remotePath);
+        debugLog('Using expanded remote path for download:', expandedRemotePath);
 
-          if (err) {
+        // Pre-flight check: verify remote file exists
+        debugLog('Checking if remote file exists:', expandedRemotePath);
+        sftp.stat(expandedRemotePath, (statErr, stats) => {
+          if (statErr) {
+            connectionPool.returnConnection(conn);
+            const duration = Date.now() - startTime;
             auditLog({
               timestamp: new Date().toISOString(),
-              command: `download ${remotePath} -> ${localPath}`,
-              error: err.message,
+              command: `download ${expandedRemotePath} -> ${normalizedLocalPath}`,
+              error: `Remote file not found: ${statErr.message}`,
               duration,
             });
-            reject(new McpError(ErrorCode.InternalError, `Download failed: ${err.message}`));
-          } else {
-            auditLog({
-              timestamp: new Date().toISOString(),
-              command: `download ${remotePath} -> ${localPath}`,
-              exitCode: 0,
-              duration,
-            });
-            resolve({
-              content: [{
-                type: 'text',
-                text: `File downloaded successfully: ${remotePath} -> ${localPath} (${duration}ms)`,
-              }],
-            });
+            return reject(new McpError(
+              ErrorCode.InvalidParams,
+              `Remote file '${expandedRemotePath}' does not exist or is not accessible. Use the 'listFiles' tool to verify the file path.`
+            ));
           }
+
+          if (!stats.isFile()) {
+            connectionPool.returnConnection(conn);
+            const duration = Date.now() - startTime;
+            auditLog({
+              timestamp: new Date().toISOString(),
+              command: `download ${expandedRemotePath} -> ${normalizedLocalPath}`,
+              error: 'Remote path is not a file',
+              duration,
+            });
+            return reject(new McpError(
+              ErrorCode.InvalidParams,
+              `Remote path '${expandedRemotePath}' is not a file (it's a directory). Specify a file path instead.`
+            ));
+          }
+
+          debugLog('Remote file exists, proceeding with download');
+
+          // Proceed with download
+          sftp.fastGet(expandedRemotePath, normalizedLocalPath, (err) => {
+            const duration = Date.now() - startTime;
+            connectionPool.returnConnection(conn);
+
+            if (err) {
+              auditLog({
+                timestamp: new Date().toISOString(),
+                command: `download ${expandedRemotePath} -> ${normalizedLocalPath}`,
+                error: err.message,
+                duration,
+              });
+              reject(new McpError(ErrorCode.InternalError, `Download failed: ${err.message}`));
+            } else {
+              auditLog({
+                timestamp: new Date().toISOString(),
+                command: `download ${expandedRemotePath} -> ${normalizedLocalPath}`,
+                exitCode: 0,
+                duration,
+              });
+              resolve({
+                content: [{
+                  type: 'text',
+                  text: `File downloaded successfully: ${expandedRemotePath} -> ${normalizedLocalPath} (${duration}ms)`,
+                }],
+              });
+            }
+          });
         });
       });
     } catch (err: any) {
       const duration = Date.now() - startTime;
       auditLog({
         timestamp: new Date().toISOString(),
-        command: `download ${remotePath} -> ${localPath}`,
+        command: `download ${remotePath} -> ${normalizedLocalPath}`,
         error: err.message,
         duration,
       });
@@ -561,20 +840,24 @@ export async function listRemoteFiles(sshConfig: any, remotePath: string): Promi
     try {
       const conn = await connectionPool.getConnection(sshConfig);
 
-      conn.sftp((err, sftp) => {
+      conn.sftp(async (err, sftp) => {
         if (err) {
           connectionPool.returnConnection(conn);
           return reject(new McpError(ErrorCode.InternalError, `SFTP session error: ${err.message}`));
         }
 
-        sftp.readdir(remotePath, (err, list) => {
+        // Expand ~ in remote path
+        const expandedRemotePath = await expandRemotePath(sftp, remotePath);
+        debugLog('Using expanded remote path for listFiles:', expandedRemotePath);
+
+        sftp.readdir(expandedRemotePath, (err, list) => {
           const duration = Date.now() - startTime;
           connectionPool.returnConnection(conn);
 
           if (err) {
             auditLog({
               timestamp: new Date().toISOString(),
-              command: `listFiles ${remotePath}`,
+              command: `listFiles ${expandedRemotePath}`,
               error: err.message,
               duration,
             });
@@ -582,7 +865,7 @@ export async function listRemoteFiles(sshConfig: any, remotePath: string): Promi
           } else {
             auditLog({
               timestamp: new Date().toISOString(),
-              command: `listFiles ${remotePath}`,
+              command: `listFiles ${expandedRemotePath}`,
               exitCode: 0,
               duration,
             });
@@ -597,7 +880,7 @@ export async function listRemoteFiles(sshConfig: any, remotePath: string): Promi
             resolve({
               content: [{
                 type: 'text',
-                text: `Files in ${remotePath}:\n${fileList}`,
+                text: `Files in ${expandedRemotePath}:\n${fileList}`,
               }],
             });
           }
