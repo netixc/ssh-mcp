@@ -2,7 +2,7 @@
 
 1. **Clone the repository:**
    ```bash
-   git clone https://github.com/tufantunc/ssh-mcp.git
+   git clone https://github.com/netixc/ssh-mcp.git
    cd ssh-mcp
    ```
 2. **Install dependencies:**
