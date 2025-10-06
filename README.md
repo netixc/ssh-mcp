@@ -11,7 +11,7 @@
    ```
 
 
-```commandline
+   ```commandline
         "ssh-mcp": {
             "command": "node",
             "args": [
@@ -25,7 +25,7 @@
                 "--maxChars=none"
             ]
         }
-```
+   ```
 
 ## Client Setup
 
